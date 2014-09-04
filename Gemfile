@@ -39,3 +39,6 @@ gem 'spring',        group: :development
 # gem 'debugger', group: [:development, :test]
 
 gem 'twitter-bootstrap3-rails'
+
+gem 'elasticsearch-model'
+gem 'elasticsearch-rails'
