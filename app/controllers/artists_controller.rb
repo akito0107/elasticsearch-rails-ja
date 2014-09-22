@@ -8,7 +8,7 @@ class ArtistsController < ApplicationController
   end
   
   def search
-    
+    @songs = Song.search(params[:search]).records
   end
 
   # GET /artists/1
