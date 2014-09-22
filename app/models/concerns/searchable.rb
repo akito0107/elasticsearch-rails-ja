@@ -10,44 +10,75 @@ module Searchable
 
     # Set up index configuration and mapping
     #
-    settings index: { number_of_shards: 1, number_of_replicas: 0 } do
+    settings index: { number_of_shards: 1, 
+                      number_of_replicas: 0,
+                      analysis: {
+                        tokenizer: {
+                          kuromoji_search_tokenizer:{ #for match search query
+                            type: 'kuromoji_tokenizer',
+                            mode: 'search'
+                          },
+                          kuromoji_completion_suggest_tokenizer: { #for completion suggester 
+                            type: 'kuromoji_tokenizer',
+                            mode: 'extended'
+                          },
+                          kuromoji_term_suggest_tokenizer:{ #for term suggester
+                            type: 'kuromoji_tokenizer',
+                            mode: 'normal'
+                          }
+                        },
+                        filter:{
+                          kuromoji_pos_filter: {type: 'kuromoji_part_of_speech', stoptags: ['助詞-格助詞-一般', '助詞-終助詞']},
+                          greek_lowercase_filter: {type: 'lowercase', language: 'greek'},
+                          kuromoji_readingform_filter: {type: 'kuromoji_readingform', use_romaji: false},
+                          kuromoji_stemmer_filter: {type: 'kuromoji_stemmer'},
+                          kuromoji_stop_filter: {type: 'stop'}
+                        },
+                        analyzer:{
+                          kuromoji_search_analyzer:{
+                            type: 'custom',
+                            tokenizer: 'kuromoji_search_tokenizer',
+                            filter: ['kuromoji_baseform','cjk_width','kuromoji_pos_filter','greek_lowercase_filter','kuromoji_readingform_filter','kuromoji_stemmer_filter']
+                          },
+                          kuromoji_completion_suggest_analyzer:{
+                            type: 'custom',
+                            tokenizer: 'kuromoji_completion_suggest_tokenizer',
+                            filter: ['cjk_width','greek_lowercase_filter','kuromoji_readingform_filter']
+                          },
+                          kuromoji_term_suggest_analyzer:{
+                            type: 'custom',
+                            tokenizer: 'kuromoji_term_suggest_tokenizer',
+                            filter: ['kuromoji_readingform_filter','kuromoji_stop_filter']
+                          }
+                        }
+                      }
+      } do
       mapping do
-        indexes :title, type: 'multi_field' do
-          indexes :title,     analyzer: 'snowball'
-          indexes :tokenized, analyzer: 'simple'
+        indexes :name, type: 'multi_field' do
+          indexes :name, type: 'string', analyzer: 'kuromoji_search_analyzer'
+          indexes :completion_suggest, type: 'string', analyzer: 'kuromoji_completion_suggest_analyzer'
+          indexes :term_suggest, type: 'string', analyzer: 'kuromoji_term_suggest_analyzer'
         end
-
-        indexes :content, type: 'multi_field' do
-          indexes :content,   analyzer: 'snowball'
-          indexes :tokenized, analyzer: 'simple'
-        end
-
-        indexes :published_on, type: 'date'
-
-        indexes :authors do
-          indexes :full_name, type: 'multi_field' do
-            indexes :full_name
-            indexes :raw, analyzer: 'keyword'
+        indexes :album, type: 'nested' do
+          indexes :description, type: 'string', analyzer: 'kuromoji_search_analyzer'
+          indexes :name, type: 'multi_field' do
+            indexes :name, type: 'string', analyzer: 'kuromoji_search_analyzer'
+            indexes :completion_suggest, type: 'string',  analyzer: 'kuromoji_completion_suggest_analyzer'
+            indexes :term_suggest, type: 'string',  analyzer: 'kuromoji_term_suggest_analyzer'
           end
-        end
-
-        indexes :categories, analyzer: 'keyword'
-
-        indexes :comments, type: 'nested' do
-          indexes :body, analyzer: 'snowball'
-          indexes :stars
-          indexes :pick
-          indexes :user, analyzer: 'keyword'
-          indexes :user_location, type: 'multi_field' do
-            indexes :user_location
-            indexes :raw, analyzer: 'keyword'
+          indexes :artist, type: 'nested' do
+            indexes :introduction, type: 'string', analyzer: 'kuromoji_search_analyzer'
+            indexes :name, type: 'multi_field' do
+              indexes :name, type: 'string', analyzer: 'kuromoji_search_analyzer'
+              indexes :completion_suggest, type: 'string', analyzer: 'kuromoji_completion_suggest_analyzer'
+              indexes :term_suggest, type: 'string', analyzer: 'kuromoji_term_suggest_analyzer'
+            end
           end
         end
       end
     end
 
     # Set up callbacks for updating the index on model changes
-    #
     after_commit lambda { Indexer.perform_async(:index,  self.class.to_s, self.id) }, on: :create
     after_commit lambda { Indexer.perform_async(:update, self.class.to_s, self.id) }, on: :update
     after_commit lambda { Indexer.perform_async(:delete, self.class.to_s, self.id) }, on: :destroy
@@ -57,10 +88,16 @@ module Searchable
     #
     def as_indexed_json(options={})
       hash = self.as_json(
-        include: { authors:    { methods: [:full_name], only: [:full_name] },
-                   comments:   { only: [:body, :stars, :pick, :user, :user_location] }
-                 })
-      hash['categories'] = self.categories.map(&:title)
+        only: ['name','album_id'],
+        include: {
+          album: {only: [:name,  :description]}
+        }
+      )
+      
+      hash['album']['artist'] ||= {}
+      hash['album']['artist']['name'] = self.album.artist.name
+      hash['album']['artist']['introduction'] = self.album.artist.introduction
+      
       hash
     end
 
@@ -73,137 +110,44 @@ module Searchable
 
       # Prefill and set the filters (top-level `filter` and `facet_filter` elements)
       #
-      __set_filters = lambda do |key, f|
+      __set_filters = lambda do |f|
 
         @search_definition[:filter][:and] ||= []
         @search_definition[:filter][:and]  |= [f]
-
-        @search_definition[:facets][key.to_sym][:facet_filter][:and] ||= []
-        @search_definition[:facets][key.to_sym][:facet_filter][:and]  |= [f]
+        
       end
 
       @search_definition = {
         query: {},
-
-        highlight: {
-          pre_tags: ['<em class="label label-highlight">'],
-          post_tags: ['</em>'],
-          fields: {
-            title:    { number_of_fragments: 0 },
-            abstract: { number_of_fragments: 0 },
-            content:  { fragment_size: 50 }
-          }
-        },
-
-        filter: {},
-
-        facets: {
-          categories: {
-            terms: {
-              field: 'categories'
-            },
-            facet_filter: {}
-          },
-          authors: {
-            terms: {
-              field: 'authors.full_name.raw'
-            },
-            facet_filter: {}
-          },
-          published: {
-            date_histogram: {
-              field: 'published_on',
-              interval: 'week'
-            },
-            facet_filter: {}
-          }
-        }
+        filter: {}
       }
 
       unless query.blank?
         @search_definition[:query] = {
-          bool: {
-            should: [
-              { multi_match: {
-                  query: query,
-                  fields: ['title^10', 'abstract^2', 'content'],
-                  operator: 'and'
-                }
-              }
-            ]
+           multi_match: {
+              query: query,
+              fields: ['name','description'],
+              type: 'best_fields',
+              operator: 'and'
+            }
           }
-        }
       else
         @search_definition[:query] = { match_all: {} }
-        @search_definition[:sort]  = { published_on: 'desc' }
       end
 
-      if options[:category]
-        f = { term: { categories: options[:category] } }
-
-        __set_filters.(:authors, f)
-        __set_filters.(:published, f)
+      if options[:artist_id]
+        f = { term: { 'artist_id' => options[:artist_id] } }
+        __set_filters.(f)
       end
 
-      if options[:author]
-        f = { term: { 'authors.full_name.raw' => options[:author] } }
-
-        __set_filters.(:categories, f)
-        __set_filters.(:published, f)
+      if options[:album_id]
+        f = { term: { 'album_id' => options[:album_id] } }
+        __set_filters.(f)
       end
-
-      if options[:published_week]
-        f = {
-          range: {
-            published_on: {
-              gte: options[:published_week],
-              lte: "#{options[:published_week]}||+1w"
-            }
-          }
-        }
-
-        __set_filters.(:categories, f)
-        __set_filters.(:authors, f)
-      end
-
-      if query.present? && options[:comments]
-        @search_definition[:query][:bool][:should] ||= []
-        @search_definition[:query][:bool][:should] << {
-          nested: {
-            path: 'comments',
-            query: {
-              multi_match: {
-                query: query,
-                fields: ['body'],
-                operator: 'and'
-              }
-            }
-          }
-        }
-        @search_definition[:highlight][:fields].update 'comments.body' => { fragment_size: 50 }
-      end
-
+      
       if options[:sort]
         @search_definition[:sort]  = { options[:sort] => 'desc' }
         @search_definition[:track_scores] = true
-      end
-
-      unless query.blank?
-        @search_definition[:suggest] = {
-          text: query,
-          suggest_title: {
-            term: {
-              field: 'title.tokenized',
-              suggest_mode: 'always'
-            }
-          },
-          suggest_body: {
-            term: {
-              field: 'content.tokenized',
-              suggest_mode: 'always'
-            }
-          }
-        }
       end
 
       __elasticsearch__.search(@search_definition)
